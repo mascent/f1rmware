@@ -10,7 +10,7 @@
 #define TYPE_DATA   1
 
 /* Display buffer */
-extern uint8_t lcdBuffer[RESX*RESY];
+extern uint8_t lcdBuffer[];
 
 void lcdInit(void);
 void lcdFill(char f);

@@ -39,3 +39,4 @@ f_read
 f_write
 f_open
 f_lseek
+lcdBuffer
