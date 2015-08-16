@@ -83,4 +83,7 @@ complex_s8_t* wait_for_completed_baseband_buffer();
 
 uint32_t baseband_timestamp();
 
+void set_volume(int dx);
+int get_volume();
+void portapack_init_wfm();
 #endif/*__PORTAPACK_H__*/

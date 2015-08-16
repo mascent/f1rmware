@@ -55,6 +55,84 @@
 //#include "rx_tpms_fsk.h"
 #include "specan.h"
 
+#include <rad1olib/pins.h>
+#include <libopencm3/lpc43xx/dac.h>
+#include <libopencm3/lpc43xx/m4/nvic.h>
+#include <libopencm3/lpc43xx/ritimer.h>
+#include <libopencm3/cm3/vector.h>
+#include <libopencm3/lpc43xx/gpio.h>
+
+// 16kByte in ram_l0dable section
+// this is in 16bit values:
+#define SAMPLES_SIZE (16*1024 / 2)
+#define SAMPLES_BUF 0x10080000
+#define RITIMER_RATE (204000000/14)
+// ^^^ what is this clock actually set to?
+// will auto-correct that when sending audio
+#define SAMPLE_RATE 48000
+uint16_t *samples = (uint16_t*) SAMPLES_BUF;
+static volatile int samples_head = 0;
+static volatile int samples_pos = 0;
+static volatile int samples_running = 0;
+static vector_table_entry_t old_isr;
+static int volume = 8;
+static volatile int ritimer_val = (RITIMER_RATE / SAMPLE_RATE);
+
+void set_volume(int dx) {
+    volume = volume + dx;
+    if(volume < 1) volume = 1;
+    if(volume > 30) volume = 30;
+}
+int get_volume() {
+    return volume;
+}
+
+void samples_stop(void) {
+    // stop interrupt handler
+    RITIMER_CTRL &= ~(RITIMER_CTRL_RITEN(1));
+    nvic_disable_irq(NVIC_RITIMER_IRQ);
+    vector_table.irq[NVIC_RITIMER_IRQ] = old_isr;
+    dac_set(0);
+}
+
+int samples_fill() {
+    // wraparound
+    if(samples_head < samples_pos) return samples_head + (SAMPLES_SIZE - samples_pos);
+    return samples_head - samples_pos;
+}
+
+void SAMPLES_isr(void) {
+    // check if it actually is an RITIMER interrupt
+    if((RITIMER_CTRL | RITIMER_CTRL_RITINT(1)) == 0) {
+        // nope, ignore it.
+        return;
+    }
+
+    if(samples_running != 0 && samples_pos != samples_head) {
+        dac_set(samples[samples_pos]);
+        samples_pos++;
+        if(samples_pos == SAMPLES_SIZE) samples_pos = 0;
+    }
+    // reset interrupt flag
+    RITIMER_CTRL |= RITIMER_CTRL_RITINT(1);
+}
+void samples_start(void) {
+    for(int i=0; i < SAMPLES_SIZE/4; i++) ((uint32_t*)samples)[i] = 0;
+    samples_pos = 0;
+    samples_head = 0;
+    samples_running = 0;
+    ritimer_val = (RITIMER_RATE / SAMPLE_RATE);
+    // timer setup
+    old_isr = vector_table.irq[NVIC_RITIMER_IRQ];
+    RITIMER_MASK = 0;
+    RITIMER_COUNTER = 0;
+    RITIMER_CTRL |= RITIMER_CTRL_RITEN(1) | RITIMER_CTRL_RITENCLR(1);
+    RITIMER_COMPVAL = ritimer_val;
+    vector_table.irq[NVIC_RITIMER_IRQ] = SAMPLES_isr;
+    nvic_enable_irq(NVIC_RITIMER_IRQ);
+    nvic_set_priority(NVIC_RITIMER_IRQ, 1);
+}
+
 // #include "ipc.h"
 // #include "ipc_m4.h"
 // #include "ipc_m0_client.h"
@@ -70,12 +148,34 @@ static uint32_t systick_difference(const uint32_t t1, const uint32_t t2) {
 }
 
 uint32_t sctr=0;
-#include <libopencm3/lpc43xx/dac.h>
-
-uint16_t* sram = (uint16_t*)0x20000000;
-uint16_t* send = (uint16_t*)0x20004000;
 void copy_to_audio_output(const int16_t* const source, const size_t sample_count) {
     sctr+=sample_count;
+    for(size_t i=0; i<sample_count; i++) {
+        int sample = source[i]*volume;
+        if(sample > 0x7FFF) sample = 0x7FFF;
+        if(sample < -0x7FFF) sample = -0x7FFF;
+        sample += 0x8000;
+        sample = sample >> 6;
+        samples[samples_head++] = sample;
+        //uint32_t sample = (source[i] + 0x8000) >> 8;
+        if(samples_head == SAMPLES_SIZE) samples_head = 0;
+    }
+    if(samples_running == 0) {
+        if(samples_fill() >= SAMPLES_SIZE/2) {
+            samples_running = 1;
+        }
+    } else if(samples_running++ == 1000) {
+        samples_running = 1;
+        int corr = samples_fill() - (SAMPLES_SIZE/2);
+        if(corr < -4096) ritimer_val++;
+        if(corr > 4096) {
+            ritimer_val--;
+            if(ritimer_val <= 0) ritimer_val = 100;
+            RITIMER_COUNTER = 0;
+        }
+        RITIMER_COMPVAL = ritimer_val;
+    }
+
     /*
     if(sram < send){
         for(size_t i=0; i<sample_count; i++) {
@@ -305,6 +405,69 @@ void rtc_isr() {
 
 #include "portapack_driver.h"
 
+void portapack_init_wfm() {
+	cpu_clock_pll1_max_speed();
+	
+// 	portapack_cpld_jtag_io_init();
+
+	device_state->tuned_hz = 97700000;
+	device_state->lna_gain_db = 0;
+	device_state->if_gain_db = 32;
+	device_state->bb_gain_db = 32;
+	device_state->audio_out_gain_db = 0;
+	device_state->receiver_configuration_index = RECEIVER_CONFIGURATION_SPEC;
+
+//	ipc_channel_init(&device_state->ipc_m4, ipc_m4_buffer);
+//	ipc_channel_init(&device_state->ipc_m0, ipc_m0_buffer);
+
+//	portapack_i2s_init();
+
+	sgpio_set_slice_mode(false);
+
+	ssp1_init();
+	rf_path_init();
+	rf_path_set_direction(RF_PATH_DIRECTION_RX);
+
+	rf_path_set_lna((device_state->lna_gain_db >= 14) ? 1 : 0);
+	max2837_set_lna_gain(device_state->if_gain_db);	/* 8dB increments */
+	max2837_set_vga_gain(device_state->bb_gain_db);	/* 2dB increments, up to 62dB */
+
+//	m0_configure_for_spifi();
+//	m0_run();
+
+	systick_set_reload(0xfffff); 
+	systick_set_clocksource(1);
+	systick_counter_enable();
+
+	sgpio_dma_init();
+
+	sgpio_dma_configure_lli(&lli_rx[0], 1, false, sample_buffer_0, 4096);
+	sgpio_dma_configure_lli(&lli_rx[1], 1, false, sample_buffer_1, 4096);
+
+	gpdma_lli_create_loop(&lli_rx[0], 2);
+
+	gpdma_lli_enable_interrupt(&lli_rx[0]);
+	gpdma_lli_enable_interrupt(&lli_rx[1]);
+
+	nvic_set_priority(NVIC_DMA_IRQ, 0);
+	nvic_enable_irq(NVIC_DMA_IRQ);
+
+//	nvic_set_priority(NVIC_M0CORE_IRQ, 255);
+//	nvic_enable_irq(NVIC_M0CORE_IRQ);
+
+//	set_rx_mode(RECEIVER_CONFIGURATION_SPEC);
+	set_rx_mode(RECEIVER_CONFIGURATION_WBFM);
+
+	set_frequency(device_state->tuned_hz);
+
+    samples_start();
+
+/*	rtc_init();
+	rtc_counter_interrupt_second_enable();
+	nvic_set_priority(NVIC_RTC_IRQ, 255);
+	nvic_enable_irq(NVIC_RTC_IRQ);
+    */
+}
 void portapack_init() {
 	cpu_clock_pll1_max_speed();
 	
