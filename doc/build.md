@@ -74,7 +74,7 @@ On BSD systems, use `gmake` instead of `make`.
 
 ## Flash rad1o
 
-Prerequisite: rad1o is connected to USB
+Prerequisite: rad1o is connected to USB in MSC-mode (joystick UP while you turn it on)
 
 To flash the firmware permanently, simply copy the `smartflash/IMG/*.b1n` files to the mounted mass storage of rad1o.
 If you want to just run the firmware once without permanently storing it on the rad1o, you will need the `dfu-util` mentioned above and run the `make flash` command.
